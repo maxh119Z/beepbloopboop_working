@@ -16,6 +16,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				AboutView.swift,
+				ArmTracker.mlpackage,
 				Assets.xcassets,
 				BeepBloopBoopApp.swift,
 				CameraPoseView.swift,

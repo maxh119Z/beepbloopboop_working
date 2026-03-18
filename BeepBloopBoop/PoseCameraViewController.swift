@@ -17,7 +17,7 @@ final class PoseCameraViewController: UIViewController {
 
     // MARK: - Smoothing (normalized space)
     private let holdSeconds: CFTimeInterval = 0.35
-    private let minConf: Float = 0.10
+    private let minConf: Float = 0.40
 
     private var smoothedNorm: [VNHumanBodyPoseObservation.JointName: CGPoint] = [:]
     private var lastGoodTime: [VNHumanBodyPoseObservation.JointName: CFTimeInterval] = [:]
@@ -69,15 +69,86 @@ final class PoseCameraViewController: UIViewController {
     private let sequenceHandler = VNSequenceRequestHandler()
     private let poseRequest = VNDetectHumanBodyPoseRequest()
 
+    // MARK: - Orientation Locks
+        
+        // 1. Tell iOS this screen is allowed to rotate automatically
+        override var shouldAutorotate: Bool {
+            return true
+        }
+
+        // 2. Limit the allowed rotations to Landscape ONLY
+        override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+            return .landscape
+        }
+
+        // 3. Set the default orientation when the screen first appears
+        override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation {
+            return .landscapeRight
+        }
+    
+    // MARK: - CNN State
+        private let statusLabel = UILabel()
+        private var lastCNNUpdateTime = CFAbsoluteTimeGetCurrent()
+        private let cnnInterval: CFTimeInterval = 1.0 / 10.0 // Run CNN at 10fps to save battery
+
+    private lazy var cnnRequest: VNCoreMLRequest = {
+        do {
+            let config = MLModelConfiguration()
+            let model = try ArmTracker(configuration: config).model
+            let visionModel = try VNCoreMLModel(for: model)
+            
+            // This is where we tell it what to do with the result
+            let request = VNCoreMLRequest(model: visionModel) { [weak self] request, error in
+                self?.handleCNNResults(request: request, error: error)
+            }
+            
+            request.imageCropAndScaleOption = .centerCrop
+            return request
+        } catch {
+            fatalError("Failed to load CNN model: \(error)")
+        }
+    }()
+    
     // MARK: - Lifecycle
     override func viewDidLoad() {
-        super.viewDidLoad()
-        view.backgroundColor = .black
+            super.viewDidLoad()
+            view.backgroundColor = .black
 
-        setupPreview()
-        setupOverlay()
-        setupCamera()
+            setupCamera()
+            setupPreview()
+            setupOverlay()
+            setupStatusLabel() // Add this
     }
+
+    private func setupStatusLabel() {
+            statusLabel.frame = CGRect(x: 40, y: 40, width: 300, height: 50)
+            statusLabel.textColor = .white
+            statusLabel.font = .systemFont(ofSize: 28, weight: .bold)
+            statusLabel.text = "Initializing..."
+            
+            // Shadow for readability over the camera
+            statusLabel.layer.shadowColor = UIColor.black.cgColor
+            statusLabel.layer.shadowRadius = 3.0
+            statusLabel.layer.shadowOpacity = 1.0
+            statusLabel.layer.shadowOffset = CGSize(width: 2, height: 2)
+            
+            view.addSubview(statusLabel)
+    }
+    
+    override func viewWillAppear(_ animated: Bool) {
+            super.viewWillAppear(animated)
+            
+            // Force the device screen to spin into landscape mode
+            if #available(iOS 16.0, *) {
+                guard let windowScene = view.window?.windowScene else { return }
+                windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape))
+                self.setNeedsUpdateOfSupportedInterfaceOrientations()
+            } else {
+                // Fallback for iOS 15 and older
+                UIDevice.current.setValue(UIInterfaceOrientation.landscapeRight.rawValue, forKey: "orientation")
+                UIViewController.attemptRotationToDeviceOrientation()
+            }
+        }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
@@ -92,16 +163,23 @@ final class PoseCameraViewController: UIViewController {
 
     // MARK: - Setup
     private func setupPreview() {
-        previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
-        previewLayer.videoGravity = .resizeAspectFill
+            previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
+            previewLayer.videoGravity = .resizeAspectFill
 
-        if let c = previewLayer.connection, c.isVideoMirroringSupported {
-            c.videoOrientation = .portrait
-            c.isVideoMirrored = true
+            if let c = previewLayer.connection {
+                // 1. Set the orientation
+                if c.isVideoOrientationSupported {
+                    c.videoOrientation = .landscapeRight
+                }
+                // 2. Turn off auto-pilot, THEN set the mirror
+                if c.isVideoMirroringSupported {
+                    c.automaticallyAdjustsVideoMirroring = false // <-- THE FIX
+                    c.isVideoMirrored = true
+                }
+            }
+
+            view.layer.addSublayer(previewLayer)
         }
-
-        view.layer.addSublayer(previewLayer)
-    }
 
     private func setupOverlay() {
         // Skeleton/joints
@@ -142,45 +220,39 @@ final class PoseCameraViewController: UIViewController {
     }
 
     private func setupCamera() {
-        captureSession.beginConfiguration()
-        captureSession.sessionPreset = .high
+            captureSession.beginConfiguration()
+            captureSession.sessionPreset = .high
 
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
-              let input = try? AVCaptureDeviceInput(device: device),
-              captureSession.canAddInput(input) else {
-            print("❌ Failed to create camera input.")
+            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
+                  let input = try? AVCaptureDeviceInput(device: device),
+                  captureSession.canAddInput(input) else {
+                print("❌ Failed to create camera input.")
+                captureSession.commitConfiguration()
+                return
+            }
+            captureSession.addInput(input)
+
+            videoOutput.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
+            videoOutput.alwaysDiscardsLateVideoFrames = true
+            videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
+
+            guard captureSession.canAddOutput(videoOutput) else {
+                print("❌ Failed to add video output.")
+                captureSession.commitConfiguration()
+                return
+            }
+            captureSession.addOutput(videoOutput)
+
+            // ❌ WE DELETED THE CONNECTION OVERRIDES HERE! Keep it raw!
+
             captureSession.commitConfiguration()
-            return
-        }
-        captureSession.addInput(input)
 
-        videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
-
-        guard captureSession.canAddOutput(videoOutput) else {
-            print("❌ Failed to add video output.")
-            captureSession.commitConfiguration()
-            return
-        }
-        captureSession.addOutput(videoOutput)
-
-        if let connection = videoOutput.connection(with: .video) {
-            connection.videoOrientation = .portrait
-            if connection.isVideoMirroringSupported {
-                connection.isVideoMirrored = true
+            captureQueue.async { [weak self] in
+                self?.captureSession.startRunning()
             }
         }
-
-        captureSession.commitConfiguration()
-
-        // Start on background queue (fixes your warning)
-        captureQueue.async { [weak self] in
-            self?.captureSession.startRunning()
-        }
-    }
 
     // MARK: - Processing
     private func processPose(pixelBuffer: CVPixelBuffer) {
@@ -189,10 +261,15 @@ final class PoseCameraViewController: UIViewController {
         lastVisionTime = now
 
         do {
-            // ✅ front camera portrait mirrored
-            let orientation: CGImagePropertyOrientation = .rightMirrored
-            try sequenceHandler.perform([poseRequest], on: pixelBuffer, orientation: orientation)
+            let orientation: CGImagePropertyOrientation = .downMirrored
+            
+            // Run both. The CNN results will automatically go to your 'handleCNNResults' function
+            try sequenceHandler.perform([poseRequest, cnnRequest], on: pixelBuffer, orientation: orientation)
 
+            // --- 2. Handle Pose Results ---
+       
+
+                    // --- 2. Handle Pose Results (Your existing code continues here) ---
             guard let observation = poseRequest.results?.first else {
                 DispatchQueue.main.async {
                     self.overlayLayer.path = nil
@@ -347,14 +424,12 @@ final class PoseCameraViewController: UIViewController {
 
     // MARK: - Coordinate conversion
     private func toScreen(_ p: CGPoint) -> CGPoint {
-        // p is normalized (0..1) in Vision/capture-device space.
-        // If the preview is mirrored (selfie camera style), the overlay must mirror too.
-        var cp = p
-        if previewLayer.connection?.isVideoMirrored == true {
-            cp.x = 1.0 - cp.x
+            // 1. Flip Vision's bottom-up Y-axis to Apple's top-down Y-axis
+            let rawPoint = CGPoint(x: p.x, y: p.y)
+            
+            // 2. This magic function now perfectly maps the raw data to your mirrored screen!
+            return previewLayer.layerPointConverted(fromCaptureDevicePoint: rawPoint)
         }
-        return previewLayer.layerPointConverted(fromCaptureDevicePoint: cp)
-    }
 
 
     // MARK: - Smoothing
@@ -464,6 +539,32 @@ final class PoseCameraViewController: UIViewController {
             return value >= (goodMin - margin) && value <= (goodMax + margin)
         } else {
             return value >= (goodMin + margin) && value <= (goodMax - margin)
+        }
+    }
+    
+    private func handleCNNResults(request: VNRequest, error: Error?) {
+        // 1. Check if we got results back
+        guard let results = request.results as? [VNCoreMLFeatureValueObservation],
+              let firstResult = results.first(where: { $0.featureName == "var_102" }), // Match your screenshot
+              let multiArray = firstResult.featureValue.multiArrayValue else {
+            return
+        }
+        
+        // 2. Get the 0.0 to 1.0 probability
+        let confidence = multiArray[0].floatValue
+        
+        // 3. Update the UI on the main thread
+        DispatchQueue.main.async {
+            if confidence > 0.5 {
+                self.statusLabel.text = "Arm Opened\(confidence)}"
+                self.statusLabel.textColor = .green
+            } else {
+                self.statusLabel.text = "Arm Closed\(confidence)"
+                self.statusLabel.textColor = .orange
+            }
+            
+            // Debug: Print to console so you can see the numbers changing
+            // print("CNN Confidence: \(confidence)")
         }
     }
 }
